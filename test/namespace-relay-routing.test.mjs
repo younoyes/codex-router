@@ -682,6 +682,50 @@ function groqModelFixture() {
   return { directory, userModels, model: "groq/tool-limit-fixture" };
 }
 
+function customResponsesModelFixture() {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "custom-responses-tools-"));
+  const registry = path.join(directory, "registry.json");
+  const model = "custom/responses-tools-fixture";
+  writeFileSync(
+    registry,
+    JSON.stringify({
+      version: 1,
+      providers: [{
+        id: "custom",
+        displayName: "Custom",
+        kind: "openai-compatible",
+        ownedBy: "custom",
+        authMode: "per-model",
+        perModelEndpoint: true,
+      }],
+      models: [{
+        slug: model,
+        gatewayModel: "custom-responses-tools-fixture",
+        upstreamModel: "responses-tools-fixture",
+        provider: "custom",
+        endpoint: {
+          baseUrl: "http://127.0.0.1:9/v1",
+          protocol: "openai-responses",
+          keyless: true,
+        },
+        listed: true,
+        displayName: "Custom Responses tools fixture",
+        description: "Local routing test fixture.",
+        priority: 500,
+        defaultEffort: "high",
+        reasoningLevels: [{ effort: "high", description: "Adaptive reasoning" }],
+        contextWindow: 131072,
+        autoCompact: 111411,
+        inputModalities: ["text"],
+        supportsSearchHistory: true,
+        compHash: "custom-responses-tools-fixture-v1",
+      }],
+    }),
+    "utf8",
+  );
+  return { directory, registry, model };
+}
+
 function sseEvent(event) {
   return `data: ${JSON.stringify(event)}\n\n`;
 }
@@ -2207,6 +2251,43 @@ test("Responses-native routed providers inherit the model on fresh local thread 
     target: { type: "projectless" },
     model: "meta/muse-spark-1.2",
   });
+});
+
+test("per-model custom Responses endpoints keep native collaboration and search tools", async () => {
+  const fixture = customResponsesModelFixture();
+  try {
+    const requestPayload = (stream, model) => {
+      const payload = routedToolSearchHistoryPayload(stream, model);
+      payload.input.push({
+        type: "web_search_call",
+        id: "web-search-history",
+        status: "completed",
+        action: { type: "search", query: "router tools" },
+      });
+      return payload;
+    };
+    const result = await scenario(false, {
+      model: fixture.model,
+      requestPayload,
+      jsonBody: () => ({ id: "custom-native-tools", output: [] }),
+      routerEnv: { MODEL_ROUTER_REGISTRY: fixture.registry },
+    });
+    const outgoing = result.gatewayBodies[0];
+    assert.ok(outgoing.tools.some((tool) => tool?.type === "namespace"));
+    assert.ok(outgoing.tools.some((tool) => tool?.type === "tool_search"));
+    assert.ok(outgoing.input.some((item) => item?.type === "tool_search_call"));
+    assert.ok(outgoing.input.some((item) => item?.type === "tool_search_output"));
+    assert.ok(outgoing.input.some((item) => item?.type === "web_search_call"));
+    assert.equal(
+      outgoing.input.some((item) =>
+        item?.type === "message" &&
+        JSON.stringify(item).includes("[completed web search"),
+      ),
+      false,
+    );
+  } finally {
+    rmSync(fixture.directory, { recursive: true, force: true });
+  }
 });
 
 test("Azure routed spawns leave the model default to Codex while explicit overrides survive", async () => {

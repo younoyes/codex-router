@@ -1116,8 +1116,8 @@ export const MODEL_BY_GATEWAY_ID = new Map(
   MODELS.map((model) => [model.gatewayModel, model]),
 );
 
-export function providerForModel(model) {
-  const provider = RUNTIME_PROVIDERS.get(model.provider);
+export function providerForModel(model, providers = RUNTIME_PROVIDERS) {
+  const provider = providers.get(model.provider);
   // The container keeps provider identity and selection; the model owns its
   // protocol, address and credential. Do not copy endpoint identity or auth
   // into this descriptor, which consumers still use as the provider.

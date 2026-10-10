@@ -87,6 +87,15 @@ test("prefers the Linux desktop app's bundled CLI over a standalone CLI", () => 
   }
 });
 
+test("prefers the current macOS desktop CLI layout over the legacy app layout", () => {
+  const candidates = codexCandidatePaths({ platform: "darwin", home: "/test-home" });
+  const bundledIndex = candidates.indexOf("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex");
+  assert.ok(bundledIndex >= 0);
+  assert.ok(
+    bundledIndex < candidates.indexOf("/Applications/ChatGPT.app/Contents/Resources/codex"),
+  );
+});
+
 test("Codex binary fingerprint changes when the executable identity changes", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-binary-fingerprint-"));
   const firstPath = path.join(testRoot, "first", "codex.exe");

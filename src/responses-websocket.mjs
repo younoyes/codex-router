@@ -787,27 +787,6 @@ class ResponsesWebSocketPeer {
   }
 
   enqueue(text) {
-    this.pendingRequests += 1;
-    if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
-      this.fail(1008, "Too many queued Responses requests.");
-      return;
-    }
-    this.queue = this.queue
-      .then(() => this.process(text))
-      .catch(() => {
-        if (!this.closed) {
-          this.sendError(500, {
-            type: "local_router_error",
-            message: "The local router could not complete the WebSocket request.",
-          });
-        }
-      })
-      .finally(() => {
-        this.pendingRequests -= 1;
-      });
-  }
-
-  async process(text) {
     if (this.closed) return;
     if (!jsonNestingAllowed(text)) {
       this.sendError(400, {
@@ -826,10 +805,64 @@ class ResponsesWebSocketPeer {
       });
       return;
     }
+    if (request?.type === "response.interrupt") {
+      this.interrupt(request);
+      return;
+    }
+
+    this.pendingRequests += 1;
+    if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
+      this.fail(1008, "Too many queued Responses requests.");
+      return;
+    }
+    this.queue = this.queue
+      .then(() => this.process(request))
+      .catch(() => {
+        if (!this.closed) {
+          this.sendError(500, {
+            type: "local_router_error",
+            message: "The local router could not complete the WebSocket request.",
+          });
+        }
+      })
+      .finally(() => {
+        this.pendingRequests -= 1;
+      });
+  }
+
+  interrupt(request) {
+    if (typeof request.response_id !== "string" || !request.response_id ||
+        request.mode !== "discard_partial_items" ||
+        Object.keys(request).some((key) => !["type", "response_id", "mode"].includes(key))) {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        message: "response.interrupt requires response_id and mode=discard_partial_items.",
+      });
+      return;
+    }
+    const active = this.activeResponse;
+    if (active?.id === request.response_id) {
+      if (!active.terminalSeen) {
+        active.interrupted = true;
+        active.controller.abort(new Error("Responses generation interrupted."));
+      }
+      return;
+    }
+    // A completion and its interrupt can cross in flight; do not end the next response.
+    if (this.lastResponseId === request.response_id || this.continuations.has(request.response_id)) return;
+    this.sendError(400, {
+      type: "invalid_request_error",
+      code: "response_not_found",
+      message: "The response to interrupt was not found on this connection.",
+    });
+  }
+
+  async process(request) {
+    if (this.closed) return;
     if (!request || Array.isArray(request) || request.type !== "response.create") {
       this.sendError(400, {
         type: "invalid_request_error",
-        message: "Responses WebSocket messages must have type response.create.",
+        message: "Responses WebSocket messages must have type response.create or response.interrupt.",
       });
       return;
     }
@@ -924,6 +957,11 @@ class ResponsesWebSocketPeer {
     }
 
     const controller = new AbortController();
+    const active = { controller, id: undefined, interrupted: false, terminalSeen: false };
+    this.activeResponse = active;
+    const outputItems = [];
+    let outputItemsBytes = 0;
+    let continuationOverflow = false;
     const onClose = () => controller.abort(this.abortController.signal.reason);
     this.abortController.signal.addEventListener("abort", onClose, { once: true });
     let upstream;
@@ -1007,17 +1045,24 @@ class ResponsesWebSocketPeer {
           return;
         }
         if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
+        active.id = completedResponse.id;
+        controller.signal.throwIfAborted();
         if (!(await this.sendJsonWithBackpressure({
           type: "response.created",
           response: { ...completedResponse, status: "in_progress", output: [] },
         }))) return;
         for (const [outputIndex, item] of completedResponse.output.entries()) {
+          controller.signal.throwIfAborted();
+          outputItems.push(item);
           if (!(await this.sendJsonWithBackpressure({
             type: "response.output_item.done",
             output_index: outputIndex,
             item,
           }))) return;
         }
+        controller.signal.throwIfAborted();
+        active.terminalSeen = true;
+        this.lastResponseId = active.id;
         if (!(await this.sendJsonWithBackpressure({
           type: "response.completed",
           response: completedResponse,
@@ -1032,9 +1077,6 @@ class ResponsesWebSocketPeer {
         return;
       }
       if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
-      const outputItems = [];
-      let outputItemsBytes = 0;
-      let continuationOverflow = false;
       let completed;
       let terminalFailure = false;
       let terminalSeen = false;
@@ -1055,6 +1097,12 @@ class ResponsesWebSocketPeer {
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
           if (terminalSeen) return true;
+          controller.signal.throwIfAborted();
+          if (event.type === "response.created") active.id = event.response?.id;
+          if (["response.completed", "response.failed", "response.incomplete", "error"].includes(event.type)) {
+            active.terminalSeen = true;
+            this.lastResponseId = active.id;
+          }
           // Native Codex maps WebSocket `error` events only when they carry
           // an HTTP failure status. SSE can instead signal failure by ending
           // its body; the persistent socket has no such turn boundary.
@@ -1062,7 +1110,6 @@ class ResponsesWebSocketPeer {
               !(Number.isInteger(event.status) && event.status >= 400 && event.status <= 599)) {
             event = { ...event, status: 502 };
           }
-          if (!(await this.sendJsonWithBackpressure(event))) return false;
           if (event.type === "response.output_item.done" && event.item) {
             const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
             if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
@@ -1072,6 +1119,7 @@ class ResponsesWebSocketPeer {
               continuationOverflow = true;
             }
           }
+          if (!(await this.sendJsonWithBackpressure(event))) return false;
           if (event.type === "response.completed") {
             completed = event.response;
             terminalSeen = true;
@@ -1104,7 +1152,7 @@ class ResponsesWebSocketPeer {
           )
           : undefined;
         if (continuation) this.continuations.set(completed.id, continuation);
-      } else if (!terminalFailure && !this.closed) {
+      } else if (!terminalFailure && !this.closed && !active.interrupted) {
         this.sendError(502, {
           type: "local_router_stream_failed",
           message: "The internal Responses stream ended before response.completed.",
@@ -1118,6 +1166,29 @@ class ResponsesWebSocketPeer {
         });
       }
     } finally {
+      if (active.interrupted && !this.closed) {
+        this.lastResponseId = active.id;
+        this.continuations.clear();
+        const continuation = !continuationOverflow
+          ? continuationState(fullRequest.input, outputItems, this.options.maxContinuationBytes)
+          : undefined;
+        if (continuation) this.continuations.set(active.id, continuation);
+        const terminal = {
+          type: "response.incomplete",
+          response: {
+            id: active.id,
+            status: "incomplete",
+            incomplete_details: { reason: "interrupted" },
+            output: outputItems,
+          },
+        };
+        // Completed items were already streamed; keep large snapshots in the cache only.
+        if (boundedJsonByteLength(terminal, this.options.maxEventBytes) > this.options.maxEventBytes) {
+          terminal.response.output = [];
+        }
+        await this.sendJsonWithBackpressure(terminal);
+      }
+      if (this.activeResponse === active) this.activeResponse = undefined;
       this.abortController.signal.removeEventListener("abort", onClose);
       controller.abort();
     }

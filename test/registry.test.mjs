@@ -28,9 +28,42 @@ const {
   MODELS,
   PROVIDERS,
   providerNeedsNoKey,
+  providerForModel,
   readRegistryDocument,
   resolveProviderBaseUrl,
 } = await import("../src/model-registry.mjs");
+
+test("per-model endpoints own their effective protocol", () => {
+  const providers = new Map([
+    ["custom", { id: "custom", perModelEndpoint: true }],
+    ["responses", { id: "responses", protocol: "openai-responses" }],
+  ]);
+
+  assert.equal(
+    providerForModel(
+      {
+        provider: "custom",
+        endpoint: { protocol: "openai-responses" },
+      },
+      providers,
+    ).protocol,
+    "openai-responses",
+  );
+  assert.equal(
+    providerForModel({ provider: "responses" }, providers).protocol,
+    "openai-responses",
+  );
+  assert.equal(
+    providerForModel(
+      {
+        provider: "custom",
+        endpoint: { protocol: "openai-responses" },
+      },
+      providers,
+    ).protocol,
+    "openai-responses",
+  );
+});
 
 test("provider registry exposes configured API and OAuth model families", () => {
   // Order follows the deterministic sorted walk of the config/ vendor tree;
